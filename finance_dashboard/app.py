@@ -8,3 +8,5 @@ st.info(
     "Modelo: interés diario con capitalización diaria (Nu/Openbank). "
     "BBVA se modela como cuenta sin interés."
 )
+
+ACCOUNTS = ["BBVA", "Nu Turbo", "Nu 7.3", "Openbank"]
