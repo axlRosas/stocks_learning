@@ -7,12 +7,18 @@ from datetime import date, datetime, timedelta
 
 import pandas as pd
 import streamlit as st
+from app import ACCOUNTS
+
+
+from lib import db as db_conn
+from lib.ledger import AccountParams, compute_daily_ledger
+from lib.formats import mxn
 
 
 # =============================
 # Config
 # =============================
-ACCOUNTS = ["BBVA", "Nu Turbo", "Nu 7.3", "Openbank"]
+
 EXTERNAL = "EXTERNAL"  # depósito/retiro hacia fuera (nómina, gastos, etc.)
 
 DEFAULT_RATES = {
@@ -24,286 +30,21 @@ DEFAULT_RATES = {
 DEFAULT_DAY_BASIS = 360
 
 
-# =============================
-# DB
-# =============================
-def db_path() -> str:
-    os.makedirs("data", exist_ok=True)
-    return os.path.join("data", "finance.db")
-
-
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path(), check_same_thread=False)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
-
-
-def init_db(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS account_config (
-            account TEXT PRIMARY KEY,
-            annual_rate REAL NOT NULL,
-            day_basis INTEGER NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS opening_balances (
-            account TEXT PRIMARY KEY,
-            as_of_date TEXT NOT NULL,
-            amount REAL NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            tx_date TEXT NOT NULL,
-            tx_type TEXT NOT NULL,          -- deposit | withdrawal | transfer
-            from_account TEXT NOT NULL,
-            to_account TEXT NOT NULL,
-            amount REAL NOT NULL CHECK(amount >= 0),
-            description TEXT,
-            created_at TEXT NOT NULL
-        )
-        """
-    )
-
-    # Seed / upsert account_config (asegura que existan todas las cuentas)
-    existing = pd.read_sql_query("SELECT account FROM account_config", conn)["account"].tolist()
-    for a in ACCOUNTS:
-        if a not in existing:
-            conn.execute(
-                "INSERT INTO account_config(account, annual_rate, day_basis) VALUES(?,?,?)",
-                (a, float(DEFAULT_RATES[a]), int(DEFAULT_DAY_BASIS)),
-            )
-    conn.commit()
-
-    # Seed / upsert opening_balances (asegura que existan todas las cuentas)
-    existing_open = pd.read_sql_query("SELECT account FROM opening_balances", conn)["account"].tolist()
-    today = date.today().isoformat()
-    for a in ACCOUNTS:
-        if a not in existing_open:
-            conn.execute(
-                "INSERT INTO opening_balances(account, as_of_date, amount) VALUES(?,?,?)",
-                (a, today, 0.0),
-            )
-    conn.commit()
-
-
-
-def load_account_config(conn: sqlite3.Connection) -> pd.DataFrame:
-    return pd.read_sql_query("SELECT account, annual_rate, day_basis FROM account_config", conn)
-
-
-def save_account_config(conn: sqlite3.Connection, cfg: dict[str, tuple[float, int]]) -> None:
-    # cfg: {account: (annual_rate, day_basis)}
-    for account, (annual_rate, day_basis) in cfg.items():
-        conn.execute(
-            """
-            INSERT INTO account_config(account, annual_rate, day_basis)
-            VALUES(?,?,?)
-            ON CONFLICT(account) DO UPDATE SET
-              annual_rate=excluded.annual_rate,
-              day_basis=excluded.day_basis
-            """,
-            (account, float(annual_rate), int(day_basis)),
-        )
-    conn.commit()
-
-
-def load_opening_balances(conn: sqlite3.Connection) -> pd.DataFrame:
-    return pd.read_sql_query("SELECT account, as_of_date, amount FROM opening_balances", conn)
-
-
-def save_opening_balances(conn: sqlite3.Connection, openings: dict[str, tuple[str, float]]) -> None:
-    # openings: {account: (as_of_date_iso, amount)}
-    for account, (as_of_date, amount) in openings.items():
-        conn.execute(
-            """
-            INSERT INTO opening_balances(account, as_of_date, amount)
-            VALUES(?,?,?)
-            ON CONFLICT(account) DO UPDATE SET
-              as_of_date=excluded.as_of_date,
-              amount=excluded.amount
-            """,
-            (account, as_of_date, float(amount)),
-        )
-    conn.commit()
-
-
-def insert_transaction(
-    conn: sqlite3.Connection,
-    tx_date: str,
-    tx_type: str,
-    from_account: str,
-    to_account: str,
-    amount: float,
-    description: str | None,
-) -> None:
-    conn.execute(
-        """
-        INSERT INTO transactions(tx_date, tx_type, from_account, to_account, amount, description, created_at)
-        VALUES(?,?,?,?,?,?,?)
-        """,
-        (
-            tx_date,
-            tx_type,
-            from_account,
-            to_account,
-            float(amount),
-            description,
-            datetime.now().isoformat(timespec="seconds"),
-        ),
-    )
-    conn.commit()
-
-
-def load_transactions(conn: sqlite3.Connection) -> pd.DataFrame:
-    df = pd.read_sql_query(
-        """
-        SELECT id, tx_date, tx_type, from_account, to_account, amount, description, created_at
-        FROM transactions
-        ORDER BY tx_date ASC, id ASC
-        """,
-        conn,
-    )
-    if len(df):
-        df["tx_date"] = pd.to_datetime(df["tx_date"]).dt.date
-    return df
-
-
-def delete_transaction(conn: sqlite3.Connection, tx_id: int) -> None:
-    conn.execute("DELETE FROM transactions WHERE id=?", (int(tx_id),))
-    conn.commit()
-
-
-# =============================
-# Ledger / Interest
-# =============================
-@dataclass
-class AccountParams:
-    annual_rate: float
-    day_basis: int
-
-
-def compute_daily_ledger(
-    transactions: pd.DataFrame,
-    account_params: dict[str, AccountParams],
-    opening: dict[str, tuple[date, float]],
-    start: date,
-    end: date,
-) -> pd.DataFrame:
-    """
-    Construye un ledger diario por cuenta:
-    - balance_start (saldo al inicio del día)
-    - net_flow (movimientos del día)
-    - balance_for_interest = balance_start + net_flow
-    - interest = balance_for_interest * rate/day_basis (si rate>0 y balance_for_interest>0)
-    - balance_end = balance_for_interest + interest
-    """
-    if end < start:
-        start, end = end, start
-
-    # Prepara tabla de flows (neto por cuenta por fecha)
-    flows = []
-    if len(transactions):
-        for _, r in transactions.iterrows():
-            d = r["tx_date"]
-            amt = float(r["amount"])
-            fa = r["from_account"]
-            ta = r["to_account"]
-
-            # salida
-            if fa in ACCOUNTS:
-                flows.append({"date": d, "account": fa, "flow": -amt})
-            # entrada
-            if ta in ACCOUNTS:
-                flows.append({"date": d, "account": ta, "flow": +amt})
-
-    if flows:
-        flow_df = pd.DataFrame(flows)
-        flow_df = flow_df.groupby(["date", "account"], as_index=False)["flow"].sum()
-    else:
-        flow_df = pd.DataFrame(columns=["date", "account", "flow"])
-
-    # Iterar por día
-    days = (end - start).days + 1
-    balances = {a: 0.0 for a in ACCOUNTS}
-    cum_interest = {a: 0.0 for a in ACCOUNTS}
-
-    # Si una cuenta tiene opening_date == start o anterior, la aplicamos cuando toque
-    opening_map = {a: (od, float(amt)) for a, (od, amt) in opening.items()}
-
-    rows = []
-    for i in range(days):
-        current = start + timedelta(days=i)
-
-        for a in ACCOUNTS:
-            # si hoy es fecha de apertura, “seteamos” saldo inicial (override)
-            if a in opening_map and opening_map[a][0] == current:
-                balances[a] = opening_map[a][1]
-                cum_interest[a] = 0.0  # reinicia interés acumulado desde la apertura
-
-            bal_start = balances[a]
-
-            # net flow del día
-            if len(flow_df):
-                mask = (flow_df["date"] == current) & (flow_df["account"] == a)
-                net_flow = float(flow_df.loc[mask, "flow"].sum()) if mask.any() else 0.0
-            else:
-                net_flow = 0.0
-
-            bal_for_interest = bal_start + net_flow
-
-            params = account_params[a]
-            if params.annual_rate > 0 and bal_for_interest > 0:
-                interest = bal_for_interest * (params.annual_rate / params.day_basis)
-            else:
-                interest = 0.0
-
-            bal_end = bal_for_interest + interest
-
-            balances[a] = bal_end
-            cum_interest[a] += interest
-
-            rows.append(
-                {
-                    "Fecha": current,
-                    "Cuenta": a,
-                    "Saldo inicial": bal_start,
-                    "Flujo neto": net_flow,
-                    "Saldo para interés": bal_for_interest,
-                    "Interés del día": interest,
-                    "Interés acumulado": cum_interest[a],
-                    "Saldo final": bal_end,
-                }
-            )
-
-    return pd.DataFrame(rows)
-
-
-def mxn(x: float) -> str:
-    return f"${x:,.2f} MXN"
-
 
 # =============================
 # UI
 # =============================
 st.set_page_config(page_title="Interés ahorros", page_icon="📈", layout="wide")
 
-conn = get_conn()
-init_db(conn)
+conn = db_conn.get_conn()
+db_conn.init_db(conn,ACCOUNTS,DEFAULT_RATES,DEFAULT_DAY_BASIS)
 
 st.title("📈 Interés ahorros")
 st.caption("Saldos reales con movimientos + interés diario (Nu/Openbank). BBVA sin interés.")
 
-cfg_df = load_account_config(conn)
-open_df = load_opening_balances(conn)
-tx_df = load_transactions(conn)
+cfg_df = db_conn.load_account_config(conn)
+open_df = db_conn.load_opening_balances(conn)
+tx_df = db_conn.load_transactions(conn)
 
 # ---- Sidebar: config
 with st.sidebar:
@@ -336,7 +77,7 @@ with st.sidebar:
 
 
     if saved:
-        save_account_config(
+        db_conn.save_account_config(
             conn,
             {
                 "BBVA": (0.0, day_basis),
@@ -346,7 +87,7 @@ with st.sidebar:
             },
         )
 
-        save_opening_balances(
+        db_conn.save_opening_balances(
             conn,
             {
                 "BBVA": (opening_date.isoformat(), bbva_open),
@@ -360,9 +101,9 @@ with st.sidebar:
         st.rerun()
 
 # Reload updated config
-cfg_df = load_account_config(conn)
-open_df = load_opening_balances(conn)
-tx_df = load_transactions(conn)
+cfg_df = db_conn.load_account_config(conn)
+open_df = db_conn.load_opening_balances(conn)
+tx_df = db_conn.load_transactions(conn)
 
 account_params = {
     r["account"]: AccountParams(annual_rate=float(r["annual_rate"]), day_basis=int(r["day_basis"]))
@@ -390,6 +131,7 @@ with colC:
 
 ledger = compute_daily_ledger(
     transactions=tx_df,
+    accounts=ACCOUNTS,
     account_params=account_params,
     opening=opening,
     start=start,
@@ -469,16 +211,7 @@ with tab_resumen:
 
         st.markdown("---")
 
-        # Tabla compacta diaria (opcional)
-        with st.expander("Ver tabla diaria detallada"):
-            show = ledger.copy()
-            for col in ["Saldo inicial", "Flujo neto", "Saldo para interés", "Interés del día", "Interés acumulado", "Saldo final"]:
-                show[col] = show[col].map(mxn)
-            st.dataframe(show[["Fecha", "Cuenta", "Saldo inicial", "Flujo neto", "Interés del día", "Interés acumulado", "Saldo final"]],
-                         use_container_width=True, hide_index=True)
-            
-    nu_total_balance = bal_by_acct.get("Nu Turbo", 0.0) + bal_by_acct.get("Nu 7.3", 0.0)
-    st.metric("Nu total · saldo", mxn(nu_total_balance))
+
 
 
 
@@ -513,7 +246,7 @@ with tab_mov:
         elif tx_type == "transfer" and from_acc == to_acc:
             st.error("En una transferencia, 'De' y 'A' deben ser diferentes.")
         else:
-            insert_transaction(
+            db_conn.insert_transaction(
                 conn=conn,
                 tx_date=tx_date.isoformat(),
                 tx_type=tx_type,
@@ -528,7 +261,7 @@ with tab_mov:
     st.markdown("---")
     st.subheader("Historial de movimientos")
 
-    tx_df = load_transactions(conn)  # reload
+    tx_df = db_conn.load_transactions(conn)  # reload
     if tx_df.empty:
         st.info("Aún no hay movimientos. Agrega el primero arriba (o configura una apertura).")
     else:
@@ -562,6 +295,6 @@ with tab_mov:
         with st.expander("Eliminar movimiento (por ID)"):
             del_id = st.number_input("ID a borrar", min_value=1, step=1)
             if st.button("Eliminar"):
-                delete_transaction(conn, int(del_id))
+                db_conn.delete_transaction(conn, int(del_id))
                 st.success(f"Movimiento {int(del_id)} eliminado.")
                 st.rerun()
