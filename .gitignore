@@ -1,3 +1,4 @@
 data/*
 stocks_tings/*
 funds_things/*
+*.pyc*
